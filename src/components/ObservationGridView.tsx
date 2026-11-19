@@ -1,10 +1,18 @@
 import { ArrowDown, ArrowUp, Check, Plus, Trash2, Upload, X } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { inferAbbreviationFromTitle, inferGenusFromTitle } from '../data/wmoTaxonomy';
 import type { CloudObservation, SortDirection, SortField } from '../types/cloud';
 import { formatObservedTimestamp, formatWeatherCompact } from '../utils/csvAndImage';
 import { CloudPlateFallback } from './CloudPlateFallback';
 import { StarRating } from './StarRating';
+
+export interface DraftBroadcast {
+  field: string;
+  title: string;
+  abbreviation: string;
+  notes: string;
+  author?: string;
+}
 
 interface ObservationGridViewProps {
   observations: CloudObservation[];
@@ -17,6 +25,7 @@ interface ObservationGridViewProps {
   onDeleteObservation: (id: string) => void;
   onBulkDeleteObservations?: (ids: string[]) => void;
   onQuickAddObservation?: (obs: CloudObservation) => void;
+  onDraftChange?: (draft: DraftBroadcast | null) => void;
   onAddNew: () => void;
   onOpenImport: () => void;
   isFilteredEmpty?: boolean;
@@ -44,6 +53,7 @@ export function ObservationGridView({
   onDeleteObservation,
   onBulkDeleteObservations,
   onQuickAddObservation,
+  onDraftChange,
   onAddNew,
   onOpenImport,
   isFilteredEmpty = false,
@@ -64,6 +74,21 @@ export function ObservationGridView({
   const [quickOktas, setQuickOktas] = useState('');
   const [quickRating, setQuickRating] = useState(3);
   const [quickDesc, setQuickDesc] = useState('');
+
+  useEffect(() => {
+    if (!onDraftChange) return;
+    if (!isQuickAdding) {
+      onDraftChange(null);
+      return;
+    }
+    onDraftChange({
+      field: 'Quick Add Row',
+      title: quickTitle,
+      abbreviation: quickAbbr,
+      notes: quickDesc,
+      author: quickPerson.trim() || lastObserver,
+    });
+  }, [isQuickAdding, quickTitle, quickAbbr, quickDesc, quickPerson, lastObserver, onDraftChange]);
 
   const renderSortIcon = (field: SortField) => {
     if (sortField !== field) return null;

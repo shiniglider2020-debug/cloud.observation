@@ -1,12 +1,20 @@
-import { Check, Copy, Link2, Loader2, Lock, Share2, Trash2, X } from 'lucide-react';
+import { Check, ChevronDown, Copy, Link2, Loader2, Lock, Radio, Share2, Trash2, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import type { AiSummaryReport, CloudObservation, CreatedShareRecord } from '../types/cloud';
 
-const MY_SHARES_KEY = 'nephos_my_shares_v1';
+const MY_LIVE_ROOMS_KEY = 'nephos_my_live_rooms_v1';
 
-function loadMyShares(): CreatedShareRecord[] {
+export interface CreatedLiveRoomRecord {
+  liveId: string;
+  title: string;
+  hostName: string;
+  url: string;
+  createdAt: string;
+  hasPasscode: boolean;
+}
+
+function loadMyLiveRooms(): CreatedLiveRoomRecord[] {
   try {
-    const raw = localStorage.getItem(MY_SHARES_KEY);
+    const raw = localStorage.getItem(MY_LIVE_ROOMS_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -15,146 +23,169 @@ function loadMyShares(): CreatedShareRecord[] {
   }
 }
 
+export function resolvePublicLiveUrl(
+  liveId: string,
+  title: string,
+  hostName: string,
+  serverAppUrl?: string | null
+): string {
+  const rawBase = (serverAppUrl || window.location.origin).replace(/\/+$/, '');
+  const shareBase = rawBase.replace(/^https:\/\/ais-dev-/, 'https://ais-pre-');
+  const url = new URL(`${shareBase}/`);
+  url.searchParams.set('live', liveId);
+  if (title.trim()) url.searchParams.set('title', title.trim());
+  if (hostName.trim()) url.searchParams.set('host', hostName.trim());
+  return url.toString();
+}
+
 interface ShareModalProps {
   isOpen: boolean;
   onClose: () => void;
-  allObservations: CloudObservation[];
-  filteredObservations: CloudObservation[];
-  aiReport: AiSummaryReport | null;
   defaultAuthor: string;
   presetTitle?: string;
-  presetObservations?: CloudObservation[] | null;
+  activeLiveSession?: {
+    liveId: string;
+    title: string;
+    shareUrl: string;
+  } | null;
+  onStartLiveSession: (session: {
+    liveId: string;
+    title: string;
+    hostName: string;
+    passcode?: string;
+    shareUrl: string;
+  }) => void;
+  onEndLiveSession?: (liveId: string) => void;
 }
 
 export function ShareModal({
   isOpen,
   onClose,
-  allObservations,
-  filteredObservations,
-  aiReport,
   defaultAuthor,
   presetTitle,
-  presetObservations,
+  activeLiveSession,
+  onStartLiveSession,
+  onEndLiveSession,
 }: ShareModalProps) {
-  const [scope, setScope] = useState<'preset' | 'all' | 'filtered'>('all');
-  const [title, setTitle] = useState('');
-  const [sharedBy, setSharedBy] = useState('');
+  const [title, setTitle] = useState('Live Sky Watch');
+  const [hostName, setHostName] = useState('');
   const [passcode, setPasscode] = useState('');
-  const [includeSummary, setIncludeSummary] = useState(true);
+  const [showPasscodeField, setShowPasscodeField] = useState(false);
 
   const [isCreating, setIsCreating] = useState(false);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [myShares, setMyShares] = useState<CreatedShareRecord[]>(() => loadMyShares());
+  const [myLiveRooms, setMyLiveRooms] = useState<CreatedLiveRoomRecord[]>(() =>
+    loadMyLiveRooms()
+  );
 
   useEffect(() => {
     if (!isOpen) return;
-    setShareUrl(null);
-    setCopied(false);
     setError(null);
+    setCopied(false);
     setPasscode('');
-    setSharedBy(defaultAuthor);
-    if (presetObservations && presetObservations.length > 0) {
-      setScope('preset');
-      setTitle(presetTitle || 'Private Cloud Album');
-    } else if (filteredObservations.length !== allObservations.length) {
-      setScope('filtered');
-      setTitle('Filtered Cloud Observation Ledger');
-    } else {
-      setScope('all');
-      setTitle('Private Cloud Observation Ledger');
-    }
-  }, [
-    isOpen,
-    presetObservations,
-    presetTitle,
-    defaultAuthor,
-    filteredObservations.length,
-    allObservations.length,
-  ]);
+    setShowPasscodeField(false);
+    setHostName(defaultAuthor || '');
+    setTitle(presetTitle?.trim() ? presetTitle.trim() : 'Live Sky Watch');
+    setShareUrl(activeLiveSession ? activeLiveSession.shareUrl : null);
+    setMyLiveRooms(loadMyLiveRooms());
+  }, [isOpen, defaultAuthor, presetTitle, activeLiveSession]);
 
   if (!isOpen) return null;
 
-  const targetObservations =
-    scope === 'preset' && presetObservations
-      ? presetObservations
-      : scope === 'filtered'
-      ? filteredObservations
-      : allObservations;
-
-  const persistMyShares = (next: CreatedShareRecord[]) => {
-    setMyShares(next);
+  const persistRooms = (next: CreatedLiveRoomRecord[]) => {
+    setMyLiveRooms(next);
     try {
-      localStorage.setItem(MY_SHARES_KEY, JSON.stringify(next));
+      localStorage.setItem(MY_LIVE_ROOMS_KEY, JSON.stringify(next));
     } catch {
-      // Ignore
+      // Ignore storage failures
     }
   };
 
-  const handleGenerateLink = async (e: React.FormEvent) => {
+  const handleCreateLiveSession = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (targetObservations.length === 0) {
-      setError('Cannot share an empty observation list.');
-      return;
-    }
-
     setIsCreating(true);
     setError(null);
+
     try {
-      const response = await fetch('/api/shares', {
+      const cleanTitle = title.trim() || 'Live Sky Watch';
+      const cleanHost = hostName.trim() || 'Observer';
+      const cleanPasscode = passcode.trim();
+
+      const response = await fetch('/api/live', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          title: title.trim() || 'Private Cloud Observation Ledger',
-          sharedBy: sharedBy.trim() || 'Observer',
-          passcode: passcode.trim(),
-          observations: targetObservations,
-          summaryReport: includeSummary ? aiReport : null,
+          title: cleanTitle,
+          hostName: cleanHost,
+          passcode: cleanPasscode,
         }),
       });
+
       const data = (await response.json()) as {
-        shareId?: string;
+        liveId?: string;
+        title?: string;
+        hostName?: string;
         createdAt?: string;
         hasPasscode?: boolean;
         appUrl?: string | null;
         error?: string;
       };
-      if (!response.ok || !data.shareId) {
-        throw new Error(data.error || 'Failed to create private share link.');
+
+      if (!response.ok || !data.liveId) {
+        throw new Error(data.error || 'Failed to start live writing session.');
       }
 
-      const baseUrl = data.appUrl || window.location.origin;
-      const url = `${baseUrl}/?share=${data.shareId}`;
-      setShareUrl(url);
+      const publicUrl = resolvePublicLiveUrl(
+        data.liveId,
+        data.title || cleanTitle,
+        data.hostName || cleanHost,
+        data.appUrl
+      );
 
-      const newRecord: CreatedShareRecord = {
-        shareId: data.shareId,
-        title: title.trim() || 'Private Cloud Observation Ledger',
-        url,
+      setShareUrl(publicUrl);
+
+      const nextRecord: CreatedLiveRoomRecord = {
+        liveId: data.liveId,
+        title: data.title || cleanTitle,
+        hostName: data.hostName || cleanHost,
+        url: publicUrl,
         createdAt: data.createdAt || new Date().toISOString(),
         hasPasscode: Boolean(data.hasPasscode),
-        count: targetObservations.length,
       };
-      persistMyShares([newRecord, ...myShares].slice(0, 12));
+      const deduped = [nextRecord, ...myLiveRooms.filter((r) => r.liveId !== data.liveId)].slice(
+        0,
+        10
+      );
+      persistRooms(deduped);
+
+      onStartLiveSession({
+        liveId: data.liveId,
+        title: nextRecord.title,
+        hostName: nextRecord.hostName,
+        passcode: cleanPasscode || undefined,
+        shareUrl: publicUrl,
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to create share link.');
+      setError(err instanceof Error ? err.message : 'Unable to start live writing session.');
     } finally {
       setIsCreating(false);
     }
   };
 
-  const handleRevokeShare = async (shareId: string) => {
+  const handleEndRoom = async (liveId: string) => {
     try {
-      await fetch(`/api/shares/${encodeURIComponent(shareId)}`, { method: 'DELETE' });
+      await fetch(`/api/live/${encodeURIComponent(liveId)}`, { method: 'DELETE' });
     } catch {
-      // Proceed removing local reference
+      // Remove local record even if offline
     }
-    persistMyShares(myShares.filter((item) => item.shareId !== shareId));
-    if (shareUrl && shareUrl.includes(shareId)) {
+    persistRooms(myLiveRooms.filter((r) => r.liveId !== liveId));
+    if (shareUrl && shareUrl.includes(liveId)) {
       setShareUrl(null);
     }
+    onEndLiveSession?.(liveId);
   };
 
   const handleCopyUrl = async (urlToCopy: string, id?: string) => {
@@ -172,14 +203,18 @@ export function ShareModal({
     if (!shareUrl || typeof navigator.share !== 'function') return;
     try {
       await navigator.share({
-        title: title || 'Cloud Observation Ledger',
-        text: `View ${targetObservations.length} sky observations on Nephos Ledger`,
+        title: title.trim() || 'Live Sky Watch',
+        text: 'Write sky notes together live in real time (no sign-in required)',
         url: shareUrl,
       });
     } catch {
       // User cancelled share sheet
     }
   };
+
+  const isPreviewHost =
+    typeof window !== 'undefined' &&
+    (window.location.origin.includes('ais-dev-') || window.location.origin.includes('ais-pre-'));
 
   return (
     <div
@@ -199,16 +234,16 @@ export function ShareModal({
               id="share-modal-title"
               className="font-display text-base font-bold text-slate-900"
             >
-              Share Private List via Secret Link
+              Share Live Writing Together
             </h2>
             <p className="mt-0.5 text-xs text-slate-500">
-              Your main ledger stays private on your device. Only recipients with this unlisted link{passcode.trim() ? ' and passcode' : ''} can open this snapshot.
+              Start a clean real-time writing room with zero saved entries and no sign-in required. Others see what you type live as you write.
             </p>
           </div>
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close share dialog"
+            aria-label="Close live share dialog"
             className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-900"
           >
             <X className="h-4 w-4" />
@@ -216,141 +251,89 @@ export function ShareModal({
         </div>
 
         <div className="flex-1 space-y-5 overflow-y-auto p-6">
-          <form onSubmit={handleGenerateLink} className="space-y-4">
+          <form onSubmit={handleCreateLiveSession} className="space-y-4">
             {error && (
               <div className="rounded-md border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs font-medium text-rose-800">
                 {error}
               </div>
             )}
 
-            <div>
-              <label className="block text-xs font-semibold text-slate-700">
-                Observations Included
-              </label>
-              <div className="mt-1.5 flex flex-wrap gap-1.5 rounded-md bg-slate-100 p-1 text-xs">
-                {presetObservations && presetObservations.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setScope('preset');
-                      setShareUrl(null);
-                    }}
-                    className={`rounded px-3 py-1.5 font-medium whitespace-nowrap transition-colors ${
-                      scope === 'preset'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600'
-                    }`}
-                  >
-                    Selected ({presetObservations.length})
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setScope('all');
-                    setShareUrl(null);
-                  }}
-                  className={`rounded px-3 py-1.5 font-medium whitespace-nowrap transition-colors ${
-                    scope === 'all' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
-                  }`}
-                >
-                  All Logged ({allObservations.length})
-                </button>
-                {filteredObservations.length !== allObservations.length && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setScope('filtered');
-                      setShareUrl(null);
-                    }}
-                    className={`rounded px-3 py-1.5 font-medium whitespace-nowrap transition-colors ${
-                      scope === 'filtered'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600'
-                    }`}
-                  >
-                    Filtered ({filteredObservations.length})
-                  </button>
-                )}
-              </div>
-            </div>
-
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
-                <label htmlFor="share-title" className="block text-xs font-semibold text-slate-700">
-                  Shared Ledger Title
+                <label htmlFor="live-title" className="block text-xs font-semibold text-slate-700">
+                  Live Session Title
                 </label>
                 <input
-                  id="share-title"
+                  id="live-title"
                   type="text"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
-                  placeholder="e.g. Bangkok Sky Log"
+                  placeholder="e.g. Live Sky Watch"
                   className="mt-1.5 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 focus:border-sky-600 focus:outline-none focus:ring-1 focus:ring-sky-600"
                 />
               </div>
 
               <div>
-                <label htmlFor="share-by" className="block text-xs font-semibold text-slate-700">
-                  Shared By
+                <label htmlFor="live-host" className="block text-xs font-semibold text-slate-700">
+                  Your Display Name
                 </label>
                 <input
-                  id="share-by"
+                  id="live-host"
                   type="text"
-                  value={sharedBy}
-                  onChange={(e) => setSharedBy(e.target.value)}
-                  placeholder="e.g. Atlas Kaytser"
+                  value={hostName}
+                  onChange={(e) => setHostName(e.target.value)}
+                  placeholder="e.g. Observer"
                   className="mt-1.5 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 focus:border-sky-600 focus:outline-none focus:ring-1 focus:ring-sky-600"
                 />
               </div>
             </div>
 
             <div>
-              <label htmlFor="share-passcode" className="block text-xs font-semibold text-slate-700">
-                Optional Access Passcode (for Private Link)
-              </label>
-              <div className="relative mt-1.5">
-                <Lock
-                  className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400"
+              <button
+                type="button"
+                onClick={() => setShowPasscodeField((v) => !v)}
+                className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900"
+              >
+                <Lock className="h-3 w-3" aria-hidden="true" />
+                <span>Passcode (optional — off by default, no sign-in required)</span>
+                <ChevronDown
+                  className={`h-3.5 w-3.5 transition-transform ${
+                    showPasscodeField ? 'rotate-180' : ''
+                  }`}
                   aria-hidden="true"
                 />
-                <input
-                  id="share-passcode"
-                  type="text"
-                  value={passcode}
-                  onChange={(e) => setPasscode(e.target.value)}
-                  placeholder="Leave blank for anyone with link, or set a passcode"
-                  className="w-full rounded-md border border-slate-300 bg-white py-2 pl-8 pr-3 font-mono text-xs text-slate-900 placeholder:font-sans placeholder:text-slate-400 focus:border-sky-600 focus:outline-none focus:ring-1 focus:ring-sky-600"
-                />
-              </div>
+              </button>
+
+              {showPasscodeField && (
+                <div className="relative mt-2">
+                  <Lock
+                    className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400"
+                    aria-hidden="true"
+                  />
+                  <input
+                    id="live-passcode"
+                    type="text"
+                    value={passcode}
+                    onChange={(e) => setPasscode(e.target.value)}
+                    placeholder="Leave blank so anyone with link joins directly"
+                    className="w-full rounded-md border border-slate-300 bg-white py-2 pl-8 pr-3 font-mono text-xs text-slate-900 placeholder:font-sans placeholder:text-slate-400 focus:border-sky-600 focus:outline-none focus:ring-1 focus:ring-sky-600"
+                  />
+                </div>
+              )}
             </div>
 
-            {aiReport && (
-              <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-700 select-none">
-                <input
-                  type="checkbox"
-                  checked={includeSummary}
-                  onChange={(e) => setIncludeSummary(e.target.checked)}
-                  className="h-3.5 w-3.5 rounded border-slate-300 text-sky-700 focus:ring-sky-600"
-                />
-                Include generated AI Synoptic Summary with shared link
-              </label>
-            )}
-
             {shareUrl ? (
-              <div className="space-y-3 rounded-md border border-sky-200 bg-sky-50/60 p-4">
+              <div className="space-y-3 rounded-md border border-sky-200 bg-sky-50/70 p-4">
                 <div className="flex items-center justify-between text-xs font-semibold text-sky-900">
                   <span className="inline-flex items-center gap-1.5">
-                    <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
-                    Private Share Link Ready
+                    <Radio className="h-3.5 w-3.5 text-emerald-600" aria-hidden="true" />
+                    Live Writing Link Ready
                   </span>
-                  {passcode.trim() && (
-                    <span className="inline-flex items-center gap-1 font-mono text-[11px] text-sky-800">
-                      <Lock className="h-3 w-3" aria-hidden="true" />
-                      Passcode Protected
-                    </span>
-                  )}
+                  <span className="text-[11px] font-normal text-sky-800">
+                    No saved entries included
+                  </span>
                 </div>
+
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
@@ -372,21 +355,38 @@ export function ShareModal({
                     ) : (
                       <>
                         <Copy className="h-3.5 w-3.5" aria-hidden="true" />
-                        Copy Link
+                        Copy Live Link
                       </>
                     )}
                   </button>
                 </div>
-                {typeof navigator !== 'undefined' && typeof navigator.share === 'function' && (
+
+                {isPreviewHost && (
+                  <p className="text-[11px] leading-relaxed text-slate-600">
+                    No app sign-in is required to join. This link uses the Shared App URL; if an external person still hits a preview access prompt, deploy/publish the app so anyone can open it directly.
+                  </p>
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                   <button
                     type="button"
-                    onClick={handleNativeShare}
-                    className="inline-flex items-center gap-1.5 text-xs font-medium text-sky-800 hover:text-sky-950"
+                    onClick={onClose}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-sky-700 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-800"
                   >
-                    <Share2 className="h-3.5 w-3.5" aria-hidden="true" />
-                    Send via system share sheet
+                    Start Writing Live
                   </button>
-                )}
+
+                  {typeof navigator !== 'undefined' && typeof navigator.share === 'function' && (
+                    <button
+                      type="button"
+                      onClick={handleNativeShare}
+                      className="inline-flex items-center gap-1.5 text-xs font-medium text-sky-800 hover:text-sky-950"
+                    >
+                      <Share2 className="h-3.5 w-3.5" aria-hidden="true" />
+                      System share
+                    </button>
+                  )}
+                </div>
               </div>
             ) : (
               <div className="flex items-center justify-end gap-2.5 border-t border-slate-100 pt-4">
@@ -399,18 +399,18 @@ export function ShareModal({
                 </button>
                 <button
                   type="submit"
-                  disabled={isCreating || targetObservations.length === 0}
+                  disabled={isCreating}
                   className="inline-flex items-center gap-2 rounded-md bg-sky-700 px-4 py-2 text-xs font-semibold text-white hover:bg-sky-800 disabled:opacity-60"
                 >
                   {isCreating ? (
                     <>
                       <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                      Creating Private Link...
+                      Starting Live Room...
                     </>
                   ) : (
                     <>
                       <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
-                      Create Private Link ({targetObservations.length})
+                      Create Live Writing Link
                     </>
                   )}
                 </button>
@@ -418,16 +418,15 @@ export function ShareModal({
             )}
           </form>
 
-          {/* Manage & Revoke Active Shared Links */}
-          {myShares.length > 0 && (
+          {myLiveRooms.length > 0 && (
             <div className="border-t border-slate-200 pt-4">
               <h3 className="text-xs font-semibold text-slate-700">
-                Your Active Shared Links
+                Your Active Live Rooms
               </h3>
               <div className="mt-2 divide-y divide-slate-100 rounded-md border border-slate-200">
-                {myShares.map((item) => (
+                {myLiveRooms.map((item) => (
                   <div
-                    key={item.shareId}
+                    key={item.liveId}
                     className="flex items-center justify-between gap-3 px-3 py-2.5 text-xs"
                   >
                     <div className="min-w-0 flex-1">
@@ -438,21 +437,36 @@ export function ShareModal({
                         )}
                       </div>
                       <div className="mt-0.5 font-mono text-[11px] text-slate-500 tabular-nums">
-                        {item.count} entries · {new Date(item.createdAt).toLocaleDateString()}
+                        Live writing · {new Date(item.createdAt).toLocaleDateString()}
                       </div>
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         type="button"
-                        onClick={() => handleCopyUrl(item.url, item.shareId)}
-                        className="rounded border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                        onClick={() => {
+                          onStartLiveSession({
+                            liveId: item.liveId,
+                            title: item.title,
+                            hostName: item.hostName,
+                            shareUrl: item.url,
+                          });
+                          onClose();
+                        }}
+                        className="rounded border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-semibold text-sky-800 hover:bg-sky-100"
                       >
-                        {copiedId === item.shareId ? 'Copied' : 'Copy'}
+                        Open
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleRevokeShare(item.shareId)}
-                        aria-label={`Revoke share link for ${item.title}`}
+                        onClick={() => handleCopyUrl(item.url, item.liveId)}
+                        className="rounded border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        {copiedId === item.liveId ? 'Copied' : 'Copy'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleEndRoom(item.liveId)}
+                        aria-label={`End live room ${item.title}`}
                         className="rounded border border-rose-200 bg-white p-1 text-rose-600 hover:bg-rose-50"
                       >
                         <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />

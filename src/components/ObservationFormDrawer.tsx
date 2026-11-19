@@ -27,6 +27,15 @@ interface ObservationFormDrawerProps {
   existingAlbums: string[];
   onClose: () => void;
   onSave: (observation: CloudObservation) => void;
+  onDraftChange?: (
+    draft: {
+      field: string;
+      title: string;
+      abbreviation: string;
+      notes: string;
+      author?: string;
+    } | null
+  ) => void;
 }
 
 function getCurrentLocalDateTime(): string {
@@ -47,6 +56,7 @@ export function ObservationFormDrawer({
   existingAlbums,
   onClose,
   onSave,
+  onDraftChange,
 }: ObservationFormDrawerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -84,6 +94,21 @@ export function ObservationFormDrawer({
   const [isAnalyzingPhoto, setIsAnalyzingPhoto] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!onDraftChange) return;
+    if (!isOpen) {
+      onDraftChange(null);
+      return;
+    }
+    onDraftChange({
+      field: editingObservation ? 'Editing Entry' : 'New Observation',
+      title,
+      abbreviation,
+      notes: description,
+      author: observer.trim() || lastObserver,
+    });
+  }, [isOpen, editingObservation, title, abbreviation, description, observer, lastObserver, onDraftChange]);
 
   useEffect(() => {
     if (!isOpen) return;

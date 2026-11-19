@@ -3,9 +3,11 @@ import crypto from 'crypto';
 import express from 'express';
 import type { Request, Response } from 'express';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { WebSocket, WebSocketServer } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,7 +15,12 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '50mb' }));
+
+interface ShareObservationItem {
+  id: string;
+  [key: string]: unknown;
+}
 
 interface StoredShare {
   id: string;
@@ -21,13 +28,30 @@ interface StoredShare {
   sharedBy: string;
   passcodeHash: string | null;
   createdAt: string;
-  observations: unknown[];
+  updatedAt: string;
+  collaborative: boolean;
+  observations: ShareObservationItem[];
   summaryReport: unknown | null;
+}
+
+interface StoredLedger {
+  updatedAt: string | null;
+  observations: unknown[];
+  aiReport: unknown | null;
+  lastObserver: string;
 }
 
 const SHARE_DATA_DIR = path.resolve(__dirname, '.data');
 const SHARE_DATA_FILE = path.join(SHARE_DATA_DIR, 'shares.json');
+const LEDGER_DATA_FILE = path.join(SHARE_DATA_DIR, 'ledger.json');
 const shareMemoryStore = new Map<string, StoredShare>();
+const shareRooms = new Map<string, Set<WebSocket>>();
+let ledgerMemoryStore: StoredLedger = {
+  updatedAt: null,
+  observations: [],
+  aiReport: null,
+  lastObserver: '',
+};
 
 function hashPasscode(passcode: string): string {
   return crypto.createHash('sha256').update(passcode).digest('hex');
@@ -39,7 +63,12 @@ function loadSharesFromDisk(): void {
     const raw = fs.readFileSync(SHARE_DATA_FILE, 'utf-8');
     const parsed = JSON.parse(raw) as Record<string, StoredShare>;
     Object.entries(parsed).forEach(([key, val]) => {
-      shareMemoryStore.set(key, val);
+      shareMemoryStore.set(key, {
+        ...val,
+        updatedAt: typeof val.updatedAt === 'string' ? val.updatedAt : val.createdAt,
+        collaborative: Boolean(val.collaborative),
+        observations: Array.isArray(val.observations) ? val.observations : [],
+      });
     });
   } catch {
     // Graceful fallback to memory-only if disk read fails
@@ -55,13 +84,47 @@ function persistSharesToDisk(): void {
     shareMemoryStore.forEach((val, key) => {
       obj[key] = val;
     });
-    fs.writeFileSync(SHARE_DATA_FILE, JSON.stringify(obj), 'utf-8');
+    const tmpFile = `${SHARE_DATA_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(obj), 'utf-8');
+    fs.renameSync(tmpFile, SHARE_DATA_FILE);
+  } catch {
+    // Graceful fallback if filesystem is read-only
+  }
+}
+
+function loadLedgerFromDisk(): void {
+  try {
+    if (!fs.existsSync(LEDGER_DATA_FILE)) return;
+    const raw = fs.readFileSync(LEDGER_DATA_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<StoredLedger>;
+    if (Array.isArray(parsed.observations)) {
+      ledgerMemoryStore = {
+        updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : null,
+        observations: parsed.observations,
+        aiReport: parsed.aiReport ?? null,
+        lastObserver: typeof parsed.lastObserver === 'string' ? parsed.lastObserver : '',
+      };
+    }
+  } catch {
+    // Graceful fallback to memory-only if disk read fails
+  }
+}
+
+function persistLedgerToDisk(): void {
+  try {
+    if (!fs.existsSync(SHARE_DATA_DIR)) {
+      fs.mkdirSync(SHARE_DATA_DIR, { recursive: true });
+    }
+    const tmpFile = `${LEDGER_DATA_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(ledgerMemoryStore), 'utf-8');
+    fs.renameSync(tmpFile, LEDGER_DATA_FILE);
   } catch {
     // Graceful fallback if filesystem is read-only
   }
 }
 
 loadSharesFromDisk();
+loadLedgerFromDisk();
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -176,29 +239,396 @@ app.get('/api/weather', async (req: Request, res: Response) => {
   }
 });
 
+interface LiveDraftState {
+  clientId: string;
+  author: string;
+  field: string;
+  title: string;
+  abbreviation: string;
+  notes: string;
+  updatedAt: string;
+}
+
+interface LiveWriterDraft {
+  clientId: string;
+  author: string;
+  cloudName: string;
+  abbreviation: string;
+  text: string;
+  source: string;
+  updatedAt: string;
+}
+
+interface LiveStreamNote {
+  id: string;
+  author: string;
+  cloudName: string;
+  abbreviation: string;
+  text: string;
+  createdAt: string;
+}
+
+interface LiveRoomRecord {
+  id: string;
+  title: string;
+  hostName: string;
+  passcodeHash: string | null;
+  createdAt: string;
+  sharedNote: string;
+  messages: LiveStreamNote[];
+}
+
+const LIVE_DATA_FILE = path.join(SHARE_DATA_DIR, 'live-rooms.json');
+const liveMemoryStore = new Map<string, LiveRoomRecord>();
+const endedLiveIds = new Set<string>();
+const liveSockets = new Map<string, Set<WebSocket>>();
+const liveDrafts = new Map<string, Map<string, LiveWriterDraft>>();
+
+function loadLiveRoomsFromDisk(): void {
+  try {
+    if (!fs.existsSync(LIVE_DATA_FILE)) return;
+    const raw = fs.readFileSync(LIVE_DATA_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, LiveRoomRecord>;
+    Object.entries(parsed).forEach(([key, val]) => {
+      liveMemoryStore.set(key, {
+        ...val,
+        sharedNote: typeof val.sharedNote === 'string' ? val.sharedNote : '',
+        messages: Array.isArray(val.messages) ? val.messages : [],
+      });
+    });
+  } catch {
+    // Fallback to memory
+  }
+}
+
+function persistLiveRoomsToDisk(): void {
+  try {
+    if (!fs.existsSync(SHARE_DATA_DIR)) {
+      fs.mkdirSync(SHARE_DATA_DIR, { recursive: true });
+    }
+    const obj: Record<string, LiveRoomRecord> = {};
+    liveMemoryStore.forEach((val, key) => {
+      obj[key] = val;
+    });
+    const tmpFile = `${LIVE_DATA_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(obj), 'utf-8');
+    fs.renameSync(tmpFile, LIVE_DATA_FILE);
+  } catch {
+    // Ignore read-only fs errors
+  }
+}
+
+loadLiveRoomsFromDisk();
+
+function getLiveDraftsList(liveId: string): LiveWriterDraft[] {
+  const map = liveDrafts.get(liveId);
+  return map ? Array.from(map.values()) : [];
+}
+
+function getLiveOnlineCount(liveId: string): number {
+  const clients = liveSockets.get(liveId);
+  if (!clients) return 0;
+  let count = 0;
+  clients.forEach((c) => {
+    if (c.readyState === WebSocket.OPEN) count++;
+  });
+  return count;
+}
+
+function broadcastToLiveRoom(liveId: string, message: unknown): void {
+  const clients = liveSockets.get(liveId);
+  if (!clients || clients.size === 0) return;
+  const serialized = JSON.stringify(message);
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(serialized);
+    }
+  });
+}
+
+app.post('/api/live', (req: Request, res: Response) => {
+  try {
+    const { title, hostName, passcode } = req.body as {
+      title?: string;
+      hostName?: string;
+      passcode?: string;
+    };
+
+    const cleanPasscode = passcode?.trim() ?? '';
+    const liveId = crypto.randomBytes(10).toString('hex');
+    const record: LiveRoomRecord = {
+      id: liveId,
+      title: (title || 'Live Sky Watch').trim(),
+      hostName: (hostName || 'Observer').trim(),
+      passcodeHash: cleanPasscode ? hashPasscode(cleanPasscode) : null,
+      createdAt: new Date().toISOString(),
+      sharedNote: '',
+      messages: [],
+    };
+
+    liveMemoryStore.set(liveId, record);
+    persistLiveRoomsToDisk();
+
+    const envAppUrl =
+      process.env.APP_URL && process.env.APP_URL.startsWith('http')
+        ? process.env.APP_URL.replace(/\/+$/, '')
+        : null;
+
+    res.status(201).json({
+      liveId: record.id,
+      title: record.title,
+      hostName: record.hostName,
+      createdAt: record.createdAt,
+      hasPasscode: Boolean(record.passcodeHash),
+      appUrl: envAppUrl,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to create live session.',
+    });
+  }
+});
+
+app.get('/api/live/:id', (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const id = String(req.params.id || '').trim();
+  if (!id || endedLiveIds.has(id)) {
+    res.status(404).json({ error: 'This live sharing session has ended.' });
+    return;
+  }
+
+  let record = liveMemoryStore.get(id);
+  if (!record) {
+    const titleHint = typeof req.query.title === 'string' ? req.query.title.trim() : '';
+    const hostHint = typeof req.query.host === 'string' ? req.query.host.trim() : '';
+    record = {
+      id,
+      title: titleHint || 'Live Sky Watch',
+      hostName: hostHint || 'Observer',
+      passcodeHash: null,
+      createdAt: new Date().toISOString(),
+      sharedNote: '',
+      messages: [],
+    };
+    liveMemoryStore.set(id, record);
+    persistLiveRoomsToDisk();
+  }
+
+  if (record.passcodeHash) {
+    const providedPasscode = String(req.headers['x-share-passcode'] || '').trim();
+    if (!providedPasscode || hashPasscode(providedPasscode) !== record.passcodeHash) {
+      res.status(401).json({
+        requiresPasscode: true,
+        title: record.title,
+        hostName: record.hostName,
+        createdAt: record.createdAt,
+        error: providedPasscode
+          ? 'Incorrect passcode. Please try again.'
+          : 'Passcode required to join this live session.',
+      });
+      return;
+    }
+  }
+
+  res.json({
+    id: record.id,
+    title: record.title,
+    hostName: record.hostName,
+    createdAt: record.createdAt,
+    sharedNote: record.sharedNote,
+    messages: record.messages,
+    drafts: getLiveDraftsList(id),
+    onlineCount: getLiveOnlineCount(id),
+  });
+});
+
+app.delete('/api/live/:id', (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  endedLiveIds.add(id);
+  const deleted = liveMemoryStore.delete(id);
+  if (deleted) {
+    persistLiveRoomsToDisk();
+    broadcastToLiveRoom(id, { type: 'live:ended' });
+    liveDrafts.delete(id);
+  }
+  res.json({ ended: deleted });
+});
+
+const roomDrafts = new Map<string, Map<string, LiveDraftState>>();
+
+function getRoomDraftsList(shareId: string): LiveDraftState[] {
+  const map = roomDrafts.get(shareId);
+  if (!map) return [];
+  return Array.from(map.values());
+}
+
+function broadcastToShareRoom(shareId: string, message: unknown): void {
+  const clients = shareRooms.get(shareId);
+  if (!clients || clients.size === 0) return;
+  const serialized = JSON.stringify(message);
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(serialized);
+    }
+  });
+}
+
+function getRoomCollaboratorsCount(shareId: string): number {
+  const clients = shareRooms.get(shareId);
+  if (!clients) return 0;
+  let count = 0;
+  clients.forEach((c) => {
+    if (c.readyState === WebSocket.OPEN) count++;
+  });
+  return count;
+}
+
+interface ShareEventPayload {
+  type:
+    | 'observation:upsert'
+    | 'observation:delete'
+    | 'observation:bulk_delete'
+    | 'observation:import'
+    | 'summary:update'
+    | 'ledger:clear';
+  observation?: ShareObservationItem;
+  id?: string;
+  ids?: string[];
+  observations?: ShareObservationItem[];
+  summaryReport?: unknown | null;
+}
+
+function applyShareEvent(
+  record: StoredShare,
+  event: ShareEventPayload
+): { changed: boolean; broadcastPayload: Record<string, unknown> | null } {
+  const nowIso = new Date().toISOString();
+
+  if (event.type === 'observation:upsert' && event.observation && typeof event.observation.id === 'string') {
+    const incoming = event.observation;
+    const idx = record.observations.findIndex((o) => o.id === incoming.id);
+    if (idx >= 0) {
+      record.observations[idx] = incoming;
+    } else {
+      record.observations.unshift(incoming);
+    }
+    record.updatedAt = nowIso;
+    persistSharesToDisk();
+    return {
+      changed: true,
+      broadcastPayload: { type: 'observation:upsert', observation: incoming, updatedAt: nowIso },
+    };
+  }
+
+  if (event.type === 'observation:delete' && typeof event.id === 'string') {
+    const next = record.observations.filter((o) => o.id !== event.id);
+    if (next.length !== record.observations.length) {
+      record.observations = next;
+      record.updatedAt = nowIso;
+      persistSharesToDisk();
+    }
+    return {
+      changed: true,
+      broadcastPayload: { type: 'observation:delete', id: event.id, updatedAt: nowIso },
+    };
+  }
+
+  if (event.type === 'observation:bulk_delete' && Array.isArray(event.ids)) {
+    const idSet = new Set(event.ids.filter((id): id is string => typeof id === 'string'));
+    const next = record.observations.filter((o) => !idSet.has(o.id));
+    if (next.length !== record.observations.length) {
+      record.observations = next;
+      record.updatedAt = nowIso;
+      persistSharesToDisk();
+    }
+    return {
+      changed: true,
+      broadcastPayload: {
+        type: 'observation:bulk_delete',
+        ids: Array.from(idSet),
+        updatedAt: nowIso,
+      },
+    };
+  }
+
+  if (event.type === 'observation:import' && Array.isArray(event.observations)) {
+    const existingIds = new Set(record.observations.map((o) => o.id));
+    const uniqueIncoming = event.observations.filter(
+      (item): item is ShareObservationItem =>
+        Boolean(item) && typeof item.id === 'string' && !existingIds.has(item.id)
+    );
+    if (uniqueIncoming.length > 0) {
+      record.observations = [...uniqueIncoming, ...record.observations];
+      record.updatedAt = nowIso;
+      persistSharesToDisk();
+    }
+    return {
+      changed: true,
+      broadcastPayload: {
+        type: 'observation:import',
+        observations: uniqueIncoming,
+        updatedAt: nowIso,
+      },
+    };
+  }
+
+  if (event.type === 'summary:update') {
+    record.summaryReport = event.summaryReport ?? null;
+    record.updatedAt = nowIso;
+    persistSharesToDisk();
+    return {
+      changed: true,
+      broadcastPayload: {
+        type: 'summary:update',
+        summaryReport: record.summaryReport,
+        updatedAt: nowIso,
+      },
+    };
+  }
+
+  if (event.type === 'ledger:clear') {
+    record.observations = [];
+    record.summaryReport = null;
+    record.updatedAt = nowIso;
+    persistSharesToDisk();
+    return {
+      changed: true,
+      broadcastPayload: { type: 'ledger:clear', updatedAt: nowIso },
+    };
+  }
+
+  return { changed: false, broadcastPayload: null };
+}
+
 app.post('/api/shares', (req: Request, res: Response) => {
   try {
-    const { title, sharedBy, passcode, observations, summaryReport } = req.body as {
+    const { title, sharedBy, passcode, observations, summaryReport, collaborative } = req.body as {
       title?: string;
       sharedBy?: string;
       passcode?: string;
-      observations?: unknown[];
+      observations?: ShareObservationItem[];
       summaryReport?: unknown;
+      collaborative?: boolean;
     };
 
-    if (!Array.isArray(observations) || observations.length === 0) {
-      res.status(400).json({ error: 'At least one observation is required to create a share link.' });
+    if (!Array.isArray(observations)) {
+      res.status(400).json({ error: 'observations array is required to create a share link.' });
       return;
     }
 
     const cleanPasscode = passcode?.trim() ?? '';
     const shareId = crypto.randomBytes(12).toString('hex');
+    const nowIso = new Date().toISOString();
+    const isCollaborative = collaborative !== false;
+
     const record: StoredShare = {
       id: shareId,
       title: (title || 'Private Cloud Observation Ledger').trim(),
       sharedBy: (sharedBy || 'Observer').trim(),
       passcodeHash: cleanPasscode ? hashPasscode(cleanPasscode) : null,
-      createdAt: new Date().toISOString(),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      collaborative: isCollaborative,
       observations,
       summaryReport: summaryReport ?? null,
     };
@@ -214,7 +644,10 @@ app.post('/api/shares', (req: Request, res: Response) => {
     res.status(201).json({
       shareId: record.id,
       createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
       hasPasscode: Boolean(record.passcodeHash),
+      collaborative: record.collaborative,
+      count: record.observations.length,
       appUrl: envAppUrl,
     });
   } catch (err) {
@@ -225,6 +658,7 @@ app.post('/api/shares', (req: Request, res: Response) => {
 });
 
 app.get('/api/shares/:id', (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
   const id = String(req.params.id || '').trim();
   const record = shareMemoryStore.get(id);
   if (!record) {
@@ -240,8 +674,11 @@ app.get('/api/shares/:id', (req: Request, res: Response) => {
         title: record.title,
         sharedBy: record.sharedBy,
         createdAt: record.createdAt,
+        collaborative: record.collaborative,
         count: record.observations.length,
-        error: providedPasscode ? 'Incorrect passcode. Please try again.' : 'Passcode required to open this private shared list.',
+        error: providedPasscode
+          ? 'Incorrect passcode. Please try again.'
+          : 'Passcode required to open this private shared list.',
       });
       return;
     }
@@ -252,6 +689,45 @@ app.get('/api/shares/:id', (req: Request, res: Response) => {
     title: record.title,
     sharedBy: record.sharedBy,
     createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    collaborative: record.collaborative,
+    observations: record.observations,
+    summaryReport: record.summaryReport,
+  });
+});
+
+app.post('/api/shares/:id/events', (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  const record = shareMemoryStore.get(id);
+  if (!record) {
+    res.status(404).json({ error: 'Shared cloud observation link not found or revoked.' });
+    return;
+  }
+
+  if (!record.collaborative) {
+    res.status(403).json({ error: 'This shared list is read-only.' });
+    return;
+  }
+
+  if (record.passcodeHash) {
+    const providedPasscode = String(req.headers['x-share-passcode'] || '').trim();
+    if (!providedPasscode || hashPasscode(providedPasscode) !== record.passcodeHash) {
+      res.status(401).json({ error: 'Valid passcode required to modify this shared list.' });
+      return;
+    }
+  }
+
+  const event = req.body as ShareEventPayload;
+  const { changed, broadcastPayload } = applyShareEvent(record, event);
+  if (!changed || !broadcastPayload) {
+    res.status(400).json({ error: 'Unsupported or malformed collaboration event.' });
+    return;
+  }
+
+  broadcastToShareRoom(id, broadcastPayload);
+  res.json({
+    ok: true,
+    updatedAt: record.updatedAt,
     observations: record.observations,
     summaryReport: record.summaryReport,
   });
@@ -262,8 +738,43 @@ app.delete('/api/shares/:id', (req: Request, res: Response) => {
   const deleted = shareMemoryStore.delete(id);
   if (deleted) {
     persistSharesToDisk();
+    broadcastToShareRoom(id, { type: 'share:revoked' });
   }
   res.json({ revoked: deleted });
+});
+
+app.get('/api/ledger', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(ledgerMemoryStore);
+});
+
+app.put('/api/ledger', (req: Request, res: Response) => {
+  try {
+    const body = req.body as Partial<StoredLedger>;
+    if (!Array.isArray(body.observations)) {
+      res.status(400).json({ error: 'observations array is required.' });
+      return;
+    }
+
+    const incomingUpdatedAt =
+      typeof body.updatedAt === 'string' && body.updatedAt.trim()
+        ? body.updatedAt
+        : new Date().toISOString();
+
+    ledgerMemoryStore = {
+      updatedAt: incomingUpdatedAt,
+      observations: body.observations,
+      aiReport: body.aiReport ?? null,
+      lastObserver: typeof body.lastObserver === 'string' ? body.lastObserver : '',
+    };
+
+    persistLedgerToDisk();
+    res.json({ ok: true, updatedAt: ledgerMemoryStore.updatedAt });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Failed to persist observation ledger.',
+    });
+  }
 });
 
 app.post('/api/generate-observation', async (req: Request, res: Response) => {
@@ -673,7 +1184,371 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = http.createServer(app);
+  const shareWss = new WebSocketServer({ noServer: true });
+  const liveWss = new WebSocketServer({ noServer: true });
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    try {
+      const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      if (reqUrl.pathname === '/ws/shares') {
+        shareWss.handleUpgrade(req, socket, head, (ws) => {
+          shareWss.emit('connection', ws, req);
+        });
+      } else if (reqUrl.pathname === '/ws/live') {
+        liveWss.handleUpgrade(req, socket, head, (ws) => {
+          liveWss.emit('connection', ws, req);
+        });
+      } else {
+        socket.destroy();
+      }
+    } catch {
+      socket.destroy();
+    }
+  });
+
+  liveWss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
+    try {
+      const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      const liveId = (reqUrl.searchParams.get('room') || '').trim();
+      const passcode = (reqUrl.searchParams.get('passcode') || '').trim();
+
+      if (!liveId || endedLiveIds.has(liveId)) {
+        ws.close(4004, 'Live session ended');
+        return;
+      }
+
+      let record = liveMemoryStore.get(liveId);
+      if (!record) {
+        record = {
+          id: liveId,
+          title: (reqUrl.searchParams.get('title') || '').trim() || 'Live Sky Watch',
+          hostName: (reqUrl.searchParams.get('host') || '').trim() || 'Observer',
+          passcodeHash: null,
+          createdAt: new Date().toISOString(),
+          sharedNote: '',
+          messages: [],
+        };
+        liveMemoryStore.set(liveId, record);
+        persistLiveRoomsToDisk();
+      }
+
+      if (record.passcodeHash && (!passcode || hashPasscode(passcode) !== record.passcodeHash)) {
+        ws.close(4001, 'Unauthorized');
+        return;
+      }
+
+      const clientId = crypto.randomBytes(6).toString('hex');
+      let roomSet = liveSockets.get(liveId);
+      if (!roomSet) {
+        roomSet = new Set<WebSocket>();
+        liveSockets.set(liveId, roomSet);
+      }
+      roomSet.add(ws);
+
+      const onlineCount = getLiveOnlineCount(liveId);
+      ws.send(
+        JSON.stringify({
+          type: 'live:init',
+          clientId,
+          room: {
+            id: record.id,
+            title: record.title,
+            hostName: record.hostName,
+            createdAt: record.createdAt,
+            sharedNote: record.sharedNote,
+            messages: record.messages,
+            drafts: getLiveDraftsList(liveId),
+            onlineCount,
+          },
+        })
+      );
+
+      broadcastToLiveRoom(liveId, { type: 'live:presence', onlineCount });
+
+      ws.on('message', (raw) => {
+        try {
+          const current = liveMemoryStore.get(liveId);
+          if (!current) return;
+          const msg = JSON.parse(raw.toString()) as {
+            type?: string;
+            isWriting?: boolean;
+            author?: string;
+            cloudName?: string;
+            abbreviation?: string;
+            text?: string;
+            source?: string;
+            sharedNote?: string;
+            id?: string;
+          };
+
+          if (msg.type === 'live:writing') {
+            let draftsMap = liveDrafts.get(liveId);
+            if (!draftsMap) {
+              draftsMap = new Map<string, LiveWriterDraft>();
+              liveDrafts.set(liveId, draftsMap);
+            }
+
+            const cloudName = typeof msg.cloudName === 'string' ? msg.cloudName.slice(0, 120) : '';
+            const abbreviation =
+              typeof msg.abbreviation === 'string' ? msg.abbreviation.slice(0, 40) : '';
+            const text = typeof msg.text === 'string' ? msg.text.slice(0, 500) : '';
+            const hasContent = Boolean(cloudName.trim() || abbreviation.trim() || text.trim());
+
+            if (msg.isWriting === false || !hasContent) {
+              draftsMap.delete(clientId);
+            } else {
+              draftsMap.set(clientId, {
+                clientId,
+                author: (typeof msg.author === 'string' && msg.author.trim()) || 'Observer',
+                cloudName,
+                abbreviation,
+                text,
+                source: (typeof msg.source === 'string' && msg.source.trim()) || 'Live Note',
+                updatedAt: new Date().toISOString(),
+              });
+            }
+
+            broadcastToLiveRoom(liveId, {
+              type: 'live:drafts',
+              drafts: getLiveDraftsList(liveId),
+            });
+            return;
+          }
+
+          if (msg.type === 'live:pad' && typeof msg.sharedNote === 'string') {
+            current.sharedNote = msg.sharedNote.slice(0, 8000);
+            persistLiveRoomsToDisk();
+            broadcastToLiveRoom(liveId, {
+              type: 'live:pad',
+              sharedNote: current.sharedNote,
+              updatedBy: (typeof msg.author === 'string' && msg.author.trim()) || 'Observer',
+              senderId: clientId,
+            });
+            return;
+          }
+
+          if (msg.type === 'live:post' && typeof msg.id === 'string') {
+            const exists = current.messages.some((m) => m.id === msg.id);
+            if (exists) return;
+
+            const cloudName = typeof msg.cloudName === 'string' ? msg.cloudName.trim().slice(0, 120) : '';
+            const abbreviation =
+              typeof msg.abbreviation === 'string' ? msg.abbreviation.trim().slice(0, 40) : '';
+            const text = typeof msg.text === 'string' ? msg.text.trim().slice(0, 500) : '';
+            if (!cloudName && !text) return;
+
+            const entry: LiveStreamNote = {
+              id: msg.id,
+              author: (typeof msg.author === 'string' && msg.author.trim()) || 'Observer',
+              cloudName,
+              abbreviation,
+              text,
+              createdAt: new Date().toISOString(),
+            };
+            current.messages.unshift(entry);
+            if (current.messages.length > 200) {
+              current.messages = current.messages.slice(0, 200);
+            }
+            persistLiveRoomsToDisk();
+
+            const draftsMap = liveDrafts.get(liveId);
+            if (draftsMap?.delete(clientId)) {
+              broadcastToLiveRoom(liveId, {
+                type: 'live:drafts',
+                drafts: getLiveDraftsList(liveId),
+              });
+            }
+
+            broadcastToLiveRoom(liveId, { type: 'live:post', entry });
+            return;
+          }
+
+          if (msg.type === 'live:delete_post' && typeof msg.id === 'string') {
+            const next = current.messages.filter((m) => m.id !== msg.id);
+            if (next.length !== current.messages.length) {
+              current.messages = next;
+              persistLiveRoomsToDisk();
+              broadcastToLiveRoom(liveId, { type: 'live:delete_post', id: msg.id });
+            }
+          }
+        } catch {
+          // Ignore malformed WS message
+        }
+      });
+
+      ws.on('close', () => {
+        const draftsMap = liveDrafts.get(liveId);
+        if (draftsMap?.delete(clientId)) {
+          broadcastToLiveRoom(liveId, {
+            type: 'live:drafts',
+            drafts: getLiveDraftsList(liveId),
+          });
+        }
+        const activeSet = liveSockets.get(liveId);
+        if (activeSet) {
+          activeSet.delete(ws);
+          if (activeSet.size === 0) {
+            liveSockets.delete(liveId);
+          } else {
+            broadcastToLiveRoom(liveId, {
+              type: 'live:presence',
+              onlineCount: getLiveOnlineCount(liveId),
+            });
+          }
+        }
+      });
+    } catch {
+      ws.close(1011, 'Connection error');
+    }
+  });
+
+  shareWss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
+    try {
+      const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      const shareId = (reqUrl.searchParams.get('share') || '').trim();
+      const passcode = (reqUrl.searchParams.get('passcode') || '').trim();
+      const record = shareMemoryStore.get(shareId);
+
+      if (!record) {
+        ws.close(4004, 'Shared list not found');
+        return;
+      }
+
+      if (record.passcodeHash && (!passcode || hashPasscode(passcode) !== record.passcodeHash)) {
+        ws.close(4001, 'Unauthorized');
+        return;
+      }
+
+      const clientId = crypto.randomBytes(6).toString('hex');
+
+      let room = shareRooms.get(shareId);
+      if (!room) {
+        room = new Set<WebSocket>();
+        shareRooms.set(shareId, room);
+      }
+      room.add(ws);
+
+      const collaboratorsCount = getRoomCollaboratorsCount(shareId);
+      ws.send(
+        JSON.stringify({
+          type: 'init',
+          clientId,
+          drafts: getRoomDraftsList(shareId),
+          payload: {
+            id: record.id,
+            title: record.title,
+            sharedBy: record.sharedBy,
+            createdAt: record.createdAt,
+            updatedAt: record.updatedAt,
+            collaborative: record.collaborative,
+            observations: record.observations,
+            summaryReport: record.summaryReport,
+            collaboratorsCount,
+          },
+        })
+      );
+
+      broadcastToShareRoom(shareId, {
+        type: 'presence',
+        collaboratorsCount,
+      });
+
+      ws.on('message', (raw) => {
+        try {
+          const currentRecord = shareMemoryStore.get(shareId);
+          if (!currentRecord || !currentRecord.collaborative) return;
+          const parsed = JSON.parse(raw.toString()) as
+            | ({
+                type: 'writing:update';
+                isWriting?: boolean;
+                author?: string;
+                field?: string;
+                title?: string;
+                abbreviation?: string;
+                notes?: string;
+              })
+            | ShareEventPayload;
+
+          if (parsed.type === 'writing:update') {
+            let draftsMap = roomDrafts.get(shareId);
+            if (!draftsMap) {
+              draftsMap = new Map<string, LiveDraftState>();
+              roomDrafts.set(shareId, draftsMap);
+            }
+
+            const titleText = typeof parsed.title === 'string' ? parsed.title.slice(0, 140) : '';
+            const abbrText = typeof parsed.abbreviation === 'string' ? parsed.abbreviation.slice(0, 40) : '';
+            const notesText = typeof parsed.notes === 'string' ? parsed.notes.slice(0, 220) : '';
+            const hasContent = Boolean(titleText.trim() || abbrText.trim() || notesText.trim());
+
+            if (parsed.isWriting === false || !hasContent) {
+              draftsMap.delete(clientId);
+            } else {
+              draftsMap.set(clientId, {
+                clientId,
+                author: (typeof parsed.author === 'string' && parsed.author.trim()) || 'Collaborator',
+                field: (typeof parsed.field === 'string' && parsed.field.trim()) || 'Entry',
+                title: titleText,
+                abbreviation: abbrText,
+                notes: notesText,
+                updatedAt: new Date().toISOString(),
+              });
+            }
+
+            broadcastToShareRoom(shareId, {
+              type: 'writing:state',
+              drafts: getRoomDraftsList(shareId),
+            });
+            return;
+          }
+
+          const { changed, broadcastPayload } = applyShareEvent(currentRecord, parsed);
+          if (changed && broadcastPayload) {
+            if (parsed.type === 'observation:upsert') {
+              const draftsMap = roomDrafts.get(shareId);
+              if (draftsMap?.delete(clientId)) {
+                broadcastToShareRoom(shareId, {
+                  type: 'writing:state',
+                  drafts: getRoomDraftsList(shareId),
+                });
+              }
+            }
+            broadcastToShareRoom(shareId, broadcastPayload);
+          }
+        } catch {
+          // Ignore malformed message
+        }
+      });
+
+      ws.on('close', () => {
+        const draftsMap = roomDrafts.get(shareId);
+        if (draftsMap?.delete(clientId)) {
+          broadcastToShareRoom(shareId, {
+            type: 'writing:state',
+            drafts: getRoomDraftsList(shareId),
+          });
+        }
+        const activeRoom = shareRooms.get(shareId);
+        if (activeRoom) {
+          activeRoom.delete(ws);
+          if (activeRoom.size === 0) {
+            shareRooms.delete(shareId);
+            roomDrafts.delete(shareId);
+          } else {
+            broadcastToShareRoom(shareId, {
+              type: 'presence',
+              collaboratorsCount: getRoomCollaboratorsCount(shareId),
+            });
+          }
+        }
+      });
+    } catch {
+      ws.close(1011, 'Connection error');
+    }
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Nephos Ledger server running on http://localhost:${PORT}`);
   });
 }

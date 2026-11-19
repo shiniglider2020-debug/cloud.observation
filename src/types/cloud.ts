@@ -106,6 +106,8 @@ export interface SharedLedgerPayload {
   title: string;
   sharedBy: string;
   createdAt: string;
+  updatedAt?: string;
+  collaborative: boolean;
   observations: CloudObservation[];
   summaryReport: AiSummaryReport | null;
 }
@@ -116,5 +118,46 @@ export interface CreatedShareRecord {
   url: string;
   createdAt: string;
   hasPasscode: boolean;
+  collaborative: boolean;
   count: number;
+}
+
+export interface LiveDraftState {
+  clientId: string;
+  author: string;
+  field: string;
+  title: string;
+  abbreviation: string;
+  notes: string;
+  updatedAt: string;
+}
+
+export interface LiveWriterDraft {
+  clientId: string;
+  author: string;
+  cloudName: string;
+  abbreviation: string;
+  text: string;
+  source: string;
+  updatedAt: string;
+}
+
+export interface LiveStreamNote {
+  id: string;
+  author: string;
+  cloudName: string;
+  abbreviation: string;
+  text: string;
+  createdAt: string;
+}
+
+export interface LiveRoomState {
+  id: string;
+  title: string;
+  hostName: string;
+  createdAt: string;
+  sharedNote: string;
+  messages: LiveStreamNote[];
+  drafts: LiveWriterDraft[];
+  onlineCount: number;
 }
